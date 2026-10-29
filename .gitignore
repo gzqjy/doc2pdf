@@ -1,0 +1,8 @@
+build/
+*.pdf
+testdata/*.pdf
+chk_digit*
+chk_ft_adv*
+chk_wrap_test*
+risk_doc_images/
+Testing/

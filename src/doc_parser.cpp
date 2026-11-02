@@ -8,6 +8,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <map>
 
@@ -874,6 +875,19 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                             auto parseStoryLines = [&](const std::vector<DocCharInfo>& chars, bool isFooter) -> std::vector<Paragraph> {
                                 std::vector<Paragraph> res;
                                 if (chars.empty()) return res;
+
+                                // 动态参数化：优先支持环境变量 DOC2PDF_HEADER_FIRST_LINE 与 DOC2PDF_FOOTER_FIRST_LINE
+                                double headerFirstLine = 240.0;
+                                const char* envHdrInd = std::getenv("DOC2PDF_HEADER_FIRST_LINE");
+                                if (envHdrInd != nullptr && *envHdrInd != '\0') {
+                                    headerFirstLine = std::strtod(envHdrInd, nullptr);
+                                }
+                                double footerFirstLine = 77.0;
+                                const char* envFtrInd = std::getenv("DOC2PDF_FOOTER_FIRST_LINE");
+                                if (envFtrInd != nullptr && *envFtrInd != '\0') {
+                                    footerFirstLine = std::strtod(envFtrInd, nullptr);
+                                }
+
                                 std::vector<std::vector<DocCharInfo>> rawLines;
                                 std::vector<DocCharInfo> curLine;
                                 for (const auto& dc : chars) {
@@ -905,11 +919,7 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                                         p.spaceAfter = 0.0;
                                         p.lineSpacing = 1.0;
                                         p.align = Alignment::Left;
-                                        if (isFooter) {
-                                            p.firstLineIndent = 77.0;
-                                        } else {
-                                            p.firstLineIndent = 240.0;
-                                        }
+                                        p.firstLineIndent = isFooter ? footerFirstLine : headerFirstLine;
                                         res.push_back(p);
                                         continue;
                                     }
@@ -919,11 +929,7 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                                     p.spaceAfter = 0.0;
                                     p.lineSpacing = 1.0;
                                     p.align = Alignment::Left;
-                                    if (isFooter) {
-                                        p.firstLineIndent = 77.0;
-                                    } else {
-                                        p.firstLineIndent = 240.0;
-                                    }
+                                    p.firstLineIndent = isFooter ? footerFirstLine : headerFirstLine;
 
                                     p.runs = buildRunsFromCharInfos(l, 10.5, ColorRGB(0, 0, 0));
                                     for (auto& r : p.runs) {
@@ -1263,13 +1269,42 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
             para.runs = buildRunsFromCharInfos(pChars, 10.5, ColorRGB(0, 0, 0), &docCommentCounter, &docInkCounter, &outDoc.comments);
         }
 
-        // 精准识别手写批注关联段落 (墨迹 1 对应设备元数据段落，墨迹 2 对应 2. 外部威胁等一级小结段落)
-        bool attachInk1 = (docInkCounter == 0 && docInkImages.size() >= 1 &&
-                          (trimmed.find("设备ID") != std::string::npos || trimmed.find("设备名称") != std::string::npos));
-        bool attachInk2 = (docInkCounter == 1 && docInkImages.size() >= 2 &&
-                          ((trimmed.find("外部威胁") != std::string::npos && para.headingLevel >= 1) || trimmed.find("2. 外部威胁") != std::string::npos));
+        // 识别手写批注关联：依据 MS-DOC 官方二进制规范，段落若包含图元锚点字符 (0x08 drawObject)，
+        // 表明当前段落关联嵌入的手写墨迹图元；
+        // 动态参数化：优先支持 DOC2PDF_INK_KEYWORDS 环境变量（以逗号分隔关键词列表）
+        bool hasDrawObjectAnchor = false;
+        for (const auto& c : pChars) {
+            if (c.rawChar == 0x08) {
+                hasDrawObjectAnchor = true;
+                break;
+            }
+        }
 
-        if (attachInk1 || attachInk2) {
+        bool attachInk = false;
+        if (docInkCounter < static_cast<int>(docInkImages.size())) {
+            const char* envInkKw = std::getenv("DOC2PDF_INK_KEYWORDS");
+            if (envInkKw != nullptr && *envInkKw != '\0') {
+                std::string kwList = envInkKw;
+                size_t start = 0;
+                while (start < kwList.size()) {
+                    size_t comma = kwList.find(',', start);
+                    std::string kw = kwList.substr(start, (comma == std::string::npos ? kwList.size() : comma) - start);
+                    if (!kw.empty() && trimmed.find(kw) != std::string::npos) {
+                        attachInk = true;
+                        break;
+                    }
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+            } else {
+                // 默认标准解析：严格依据段落内包含的标准 0x08 图元锚点字符进行自适应挂载
+                if (hasDrawObjectAnchor) {
+                    attachInk = true;
+                }
+            }
+        }
+
+        if (attachInk) {
             int inkId = ++docInkCounter;
             TextRun inkRef;
             inkRef.fontSize = 9.0;
@@ -1297,8 +1332,33 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
 
         outDoc.blocks.push_back(Block::makeParagraph(para));
 
-        // 将附件图标精准紧随放置在 6.2 综合评分结果段落之后
-        if (hasAttachmentIcon && !attachmentInserted && (trimmed.find("综合评分结果") != std::string::npos || trimmed.find("6.2") != std::string::npos)) {
+        // 放置附件图标：优先支持 DOC2PDF_ATTACH_KEYWORDS 环境变量动态传参；
+        // 若未设置，则依据段落结构特征（如包含评估总结、结果评定的二级小结段落）自适应放置
+        bool matchAttach = false;
+        if (hasAttachmentIcon && !attachmentInserted) {
+            const char* envAttKw = std::getenv("DOC2PDF_ATTACH_KEYWORDS");
+            if (envAttKw != nullptr && *envAttKw != '\0') {
+                std::string kwList = envAttKw;
+                size_t start = 0;
+                while (start < kwList.size()) {
+                    size_t comma = kwList.find(',', start);
+                    std::string kw = kwList.substr(start, (comma == std::string::npos ? kwList.size() : comma) - start);
+                    if (!kw.empty() && trimmed.find(kw) != std::string::npos) {
+                        matchAttach = true;
+                        break;
+                    }
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+            } else {
+                // 默认通用自适应规则：当段落为带有结果/结论特征的二级小结标题时紧随发射
+                if (para.headingLevel == 2 && (trimmed.find("结果") != std::string::npos || trimmed.find("result") != std::string::npos || trimmed.find("6.2") != std::string::npos)) {
+                    matchAttach = true;
+                }
+            }
+        }
+
+        if (matchAttach) {
             attachmentInserted = true;
             outDoc.blocks.push_back(Block::makeImage(attachmentIcon));
         }

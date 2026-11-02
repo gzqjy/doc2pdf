@@ -239,6 +239,32 @@ static void testDocParser(const std::string& dataDir) {
     }
     TEST_ASSERT(imgCount == 4, "risk_report_8083890e.doc should have 4 images");
     TEST_ASSERT(tblCount >= 2, "risk_report_8083890e.doc should have at least 2 tables");
+
+    // 验证动态环境变量参数化：消除硬编码首行缩进
+    setenv("DOC2PDF_HEADER_FIRST_LINE", "180.5", 1);
+    setenv("DOC2PDF_FOOTER_FIRST_LINE", "62.5", 1);
+    Document envDoc;
+    bool okEnv = parser.parse(dataDir + "/risk_report_8083890e3.doc", envDoc, err);
+    unsetenv("DOC2PDF_HEADER_FIRST_LINE");
+    unsetenv("DOC2PDF_FOOTER_FIRST_LINE");
+    TEST_ASSERT(okEnv, "Parsing with custom env indent should succeed");
+    bool foundHdrEnv = false;
+    for (const auto& hp : envDoc.headerParagraphs) {
+        if (std::abs(hp.firstLineIndent - 180.5) < 0.1) {
+            foundHdrEnv = true;
+            break;
+        }
+    }
+    TEST_ASSERT(foundHdrEnv, "Custom DOC2PDF_HEADER_FIRST_LINE must be dynamically applied");
+
+    bool foundFtrEnv = false;
+    for (const auto& fp : envDoc.footerParagraphs) {
+        if (std::abs(fp.firstLineIndent - 62.5) < 0.1) {
+            foundFtrEnv = true;
+            break;
+        }
+    }
+    TEST_ASSERT(foundFtrEnv, "Custom DOC2PDF_FOOTER_FIRST_LINE must be dynamically applied");
 }
 
 static void testPdfRenderer(const std::string& outPath) {

@@ -136,10 +136,12 @@ struct ImageBlock {
     int pixelHeight = 0;
     double displayWidthPt = 0.0;
     double displayHeightPt = 0.0;
+    bool isAttachment = false;
+    size_t attachmentIndex = 0;
 
     ImageBlock() = default;
     ImageBlock(std::vector<uint8_t> d, std::string fmt, int pw = 0, int ph = 0, double dw = 0.0, double dh = 0.0)
-        : data(std::move(d)), format(std::move(fmt)), pixelWidth(pw), pixelHeight(ph), displayWidthPt(dw), displayHeightPt(dh) {}
+        : data(std::move(d)), format(std::move(fmt)), pixelWidth(pw), pixelHeight(ph), displayWidthPt(dw), displayHeightPt(dh), isAttachment(false), attachmentIndex(0) {}
 };
 
 enum class BlockType { Paragraph, Table, Image };
@@ -199,6 +201,7 @@ struct CommentItem {
     std::string author;
     std::string date;
     std::vector<Paragraph> paragraphs;
+    std::vector<ImageBlock> images;
 };
 
 struct AttachmentItem {

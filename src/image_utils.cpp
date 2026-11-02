@@ -194,4 +194,61 @@ bool decodePngToRgbStream(const uint8_t* pngData, size_t pngSize,
     return true;
 }
 
+bool isHandwrittenInkPng(const uint8_t* pngData, size_t pngSize) {
+    if (!pngData || pngSize < 33) return false;
+    if (pngData[0] != 0x89 || pngData[1] != 0x50 || pngData[2] != 0x4E || pngData[3] != 0x47) return false;
+    int w = (pngData[16] << 24) | (pngData[17] << 16) | (pngData[18] << 8) | pngData[19];
+    int h = (pngData[20] << 24) | (pngData[21] << 16) | (pngData[22] << 8) | pngData[23];
+    if (w <= 15 || h <= 15) return false;
+    uint8_t bitDepth = pngData[24];
+    uint8_t colorType = pngData[25];
+    if (bitDepth != 8 || (colorType != 2 && colorType != 6)) return false;
+
+    std::vector<uint8_t> idatBuffer;
+    size_t pos = 8;
+    while (pos + 8 <= pngSize) {
+        uint32_t chunkLen = (pngData[pos] << 24) | (pngData[pos + 1] << 16) | (pngData[pos + 2] << 8) | pngData[pos + 3];
+        pos += 4;
+        if (pos + 4 > pngSize) break;
+        std::string chunkType((const char*)&pngData[pos], 4);
+        pos += 4;
+        if (chunkType == "IDAT") {
+            if (pos + chunkLen > pngSize) break;
+            idatBuffer.insert(idatBuffer.end(), &pngData[pos], &pngData[pos + chunkLen]);
+        }
+        pos += chunkLen + 4;
+        if (chunkType == "IEND") break;
+    }
+    if (idatBuffer.empty()) return false;
+
+    int bpp = (colorType == 6) ? 4 : 3;
+    size_t rowBytes = w * bpp;
+    size_t expectedRawSize = (size_t)h * (1 + rowBytes);
+    std::vector<uint8_t> decomp(expectedRawSize);
+    uLongf destLen = expectedRawSize;
+    if (uncompress(decomp.data(), &destLen, idatBuffer.data(), idatBuffer.size()) != Z_OK) {
+        return false;
+    }
+
+    size_t redCount = 0;
+    size_t rawPos = 0;
+    for (int y = 0; y < h; ++y) {
+        if (rawPos >= destLen) break;
+        rawPos++; // skip filter byte
+        for (int x = 0; x < w; ++x) {
+            if (rawPos + bpp > destLen) break;
+            uint8_t r = decomp[rawPos];
+            uint8_t g = decomp[rawPos + 1];
+            uint8_t b = decomp[rawPos + 2];
+            uint8_t a = (bpp == 4) ? decomp[rawPos + 3] : 255;
+            rawPos += bpp;
+            if (a > 30 && r > 140 && g < 100 && b < 100) {
+                redCount++;
+                if (redCount > 30) return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace doc2pdf

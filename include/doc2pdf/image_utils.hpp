@@ -17,4 +17,7 @@ bool decodePngToRgbStream(const uint8_t* pngData, size_t pngSize,
                           int& width, int& height,
                           std::vector<uint8_t>& compressedRgbStream);
 
+// 检测 PNG 图像是否为手写红墨水批注 (基于红色通道笔画像素特征，无尺寸硬编码)
+bool isHandwrittenInkPng(const uint8_t* pngData, size_t pngSize);
+
 } // namespace doc2pdf

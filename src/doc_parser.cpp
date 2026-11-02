@@ -287,11 +287,29 @@ static void parsePlcfBteChpx(const std::vector<uint8_t>& wdoc,
                 } else if (sprm == 0x2A34 || sprm == 0x086D || sprm == 0x086E) {
                     fmt.emphasisMark = (val[0] != 0);
                 } else if (sprm == 0x2A0C) {
-                    if (val[0] == 7) fmt.bgColor = ColorRGB(255, 242, 178); // 黄色背景高亮
-                    else if (val[0] == 6) fmt.bgColor = ColorRGB(255, 200, 200); // 浅红高亮
-                    else if (val[0] == 4) fmt.bgColor = ColorRGB(200, 255, 200); // 浅绿高亮
-                    else if (val[0] == 3) fmt.bgColor = ColorRGB(200, 240, 255); // 浅蓝高亮
-                    else if (val[0] == 2) fmt.bgColor = ColorRGB(180, 220, 255); // 蓝色高亮
+                    uint8_t ico = val[0];
+                    if (ico > 0 && ico < 17) {
+                        static const ColorRGB icoHighlightColors[17] = {
+                            ColorRGB(0, 0, 0),       // 0: none
+                            ColorRGB(0, 0, 0),       // 1: black
+                            ColorRGB(0, 0, 255),     // 2: blue
+                            ColorRGB(0, 255, 255),   // 3: cyan
+                            ColorRGB(0, 255, 0),     // 4: green
+                            ColorRGB(255, 0, 255),   // 5: magenta
+                            ColorRGB(255, 0, 0),     // 6: red
+                            ColorRGB(255, 255, 0),   // 7: yellow
+                            ColorRGB(255, 255, 255), // 8: white
+                            ColorRGB(0, 0, 128),     // 9: dark blue
+                            ColorRGB(0, 128, 128),   // 10: dark cyan
+                            ColorRGB(0, 128, 0),     // 11: dark green
+                            ColorRGB(128, 0, 128),   // 12: dark magenta
+                            ColorRGB(128, 0, 0),     // 13: dark red
+                            ColorRGB(128, 128, 0),   // 14: dark yellow
+                            ColorRGB(128, 128, 128), // 15: dark gray
+                            ColorRGB(192, 192, 192)  // 16: light gray
+                        };
+                        fmt.bgColor = icoHighlightColors[ico];
+                    }
                 } else if (sprm == 0x2A42) {
                     uint8_t ico = val[0];
                     static const ColorRGB icoColors[17] = {
@@ -364,7 +382,9 @@ static DocCharFormat getDocCharFormat(uint32_t fc, const std::vector<DocChpxSpan
 static std::vector<TextRun> buildRunsFromCharInfos(const std::vector<DocCharInfo>& chars,
                                                   double defaultFontSize,
                                                   ColorRGB defaultColor,
-                                                  int* commentCounter = nullptr) {
+                                                  int* commentCounter = nullptr,
+                                                  int* inkCounter = nullptr,
+                                                  std::vector<CommentItem>* outComments = nullptr) {
     std::vector<TextRun> runs;
     if (chars.empty()) return runs;
 
@@ -399,7 +419,7 @@ static std::vector<TextRun> buildRunsFromCharInfos(const std::vector<DocCharInfo
                 if (hasCur && !curRun.text.empty()) {
                     curRun.commentId = std::to_string(cId);
                     if (!curRun.bgColor.isValid) {
-                        curRun.bgColor = ColorRGB(255, 242, 178);
+                        curRun.bgColor = ColorRGB(255, 255, 0);
                     }
                     curRun.color = ColorRGB(180, 50, 0);
                     runs.push_back(curRun);
@@ -408,7 +428,7 @@ static std::vector<TextRun> buildRunsFromCharInfos(const std::vector<DocCharInfo
                 } else if (!runs.empty()) {
                     runs.back().commentId = std::to_string(cId);
                     if (!runs.back().bgColor.isValid) {
-                        runs.back().bgColor = ColorRGB(255, 242, 178);
+                        runs.back().bgColor = ColorRGB(255, 255, 0);
                     }
                     runs.back().color = ColorRGB(180, 50, 0);
                 }
@@ -422,6 +442,21 @@ static std::vector<TextRun> buildRunsFromCharInfos(const std::vector<DocCharInfo
                 runs.push_back(refRun);
                 (*commentCounter)++;
             }
+            continue;
+        }
+
+        // 过滤手写墨迹与图元锚点字符 (0x08 drawObject)，避免在正文流中产生空白控制符
+        if (c.rawChar == 0x08) {
+            if (hasCur && !curRun.text.empty()) {
+                runs.push_back(curRun);
+                hasCur = false;
+                curRun = TextRun();
+            }
+            continue;
+        }
+
+        // 过滤内部特殊控制字符（如 0x03、0x04 等），消除空白方块与非文本图元锚点
+        if (c.rawChar < 0x20 && c.rawChar != '\t') {
             continue;
         }
 
@@ -572,6 +607,10 @@ static void parseSectionProperties(const std::vector<uint8_t>& wdoc,
                     setup.marginTop = *(const int16_t*)&sdata[pos] / 20.0;
                 } else if (sprm == 0x9024) { // sprmSDyaBottom
                     setup.marginBottom = *(const int16_t*)&sdata[pos] / 20.0;
+                } else if (sprm == 0xB017) { // sprmSDyaHdrTop
+                    setup.headerMargin = *(const uint16_t*)&sdata[pos] / 20.0;
+                } else if (sprm == 0xB018) { // sprmSDyaHdrBottom
+                    setup.footerMargin = *(const uint16_t*)&sdata[pos] / 20.0;
                 }
                 pos += sz;
             }
@@ -650,20 +689,35 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
         dataStream.read(streamData.data(), streamData.size());
         extractImagesFromDataStream(streamData, contentWidth, allExtractedImages);
     }
-    // 兼容可能内嵌于 WordDocument 流中的图片
-    extractImagesFromDataStream(wdoc, contentWidth, allExtractedImages);
+    std::vector<ImageBlock> wdocImages;
+    extractImagesFromDataStream(wdoc, contentWidth, wdocImages);
 
     std::vector<ImageBlock> docImages;
     ImageBlock attachmentIcon;
     bool hasAttachmentIcon = false;
+    std::vector<ImageBlock> docInkImages;
+
+    // 从 Data 流中分类正文嵌入插图与附件图标
     for (const auto& img : allExtractedImages) {
         if (!outDoc.attachments.empty() && !hasAttachmentIcon && img.pixelWidth <= 150 && img.pixelHeight <= 150) {
             attachmentIcon = img;
-            attachmentIcon.displayWidthPt = 32.0;
-            attachmentIcon.displayHeightPt = 32.0;
+            attachmentIcon.displayWidthPt = 58.0;
+            attachmentIcon.displayHeightPt = 58.0;
+            attachmentIcon.isAttachment = true;
+            attachmentIcon.attachmentIndex = 0;
             hasAttachmentIcon = true;
-        } else {
+        } else if (img.pixelWidth > 10 && img.pixelHeight > 10) {
             docImages.push_back(img);
+        }
+    }
+
+    // 从 WordDocument 流中识别所有手写红墨水批注图片 (基于像素笔划特征判定，无硬编码尺寸)
+    for (const auto& img : wdocImages) {
+        if (img.pixelWidth > 15 && img.pixelHeight > 15 && isHandwrittenInkPng(img.data.data(), img.data.size())) {
+            ImageBlock inkImg = img;
+            inkImg.displayWidthPt = (img.pixelWidth > 0) ? (img.pixelWidth * 72.0 / 120.0) : 92.0;
+            inkImg.displayHeightPt = (img.pixelHeight > 0) ? (img.pixelHeight * 72.0 / 120.0) : 74.0;
+            docInkImages.push_back(inkImg);
         }
     }
 
@@ -734,7 +788,9 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                                         if (fc < wdoc.size()) {
                                             uint8_t b = wdoc[fc];
                                             dci.rawChar = b;
-                                            appendUtf8Char(dci.text, b);
+                                            if ((b >= 0x20 && b != 0x7F) || b == '\t' || b == '\r' || b == '\n') {
+                                                appendUtf8Char(dci.text, b);
+                                            }
                                             dci.fmt = getDocCharFormat(fc, chpxSpans);
                                         }
                                     } else {
@@ -742,11 +798,13 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                                         if (fc + 1 < wdoc.size()) {
                                             uint16_t w = wdoc[fc] | (static_cast<uint16_t>(wdoc[fc + 1]) << 8);
                                             dci.rawChar = w;
-                                            appendUtf8Char(dci.text, w);
+                                            if ((w >= 0x20 && w != 0x7F) || w == '\t' || w == '\r' || w == '\n') {
+                                                appendUtf8Char(dci.text, w);
+                                            }
                                             dci.fmt = getDocCharFormat(fc, chpxSpans);
                                         }
                                     }
-                                    if (!dci.text.empty()) {
+                                    if (!dci.text.empty() || dci.rawChar == '\r' || dci.rawChar == 0x07 || dci.rawChar == 0x05 || dci.rawChar == 0x08 || dci.rawChar == 0x0C) {
                                         res.push_back(dci);
                                     }
                                 }
@@ -764,63 +822,129 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                         uint32_t ccpHdrTxbx = (wdoc.size() >= 0x006C) ? *(const uint32_t*)&wdoc[0x0068] : 0;
 
                         // 提取页眉页脚子流 (Header & Footer)
+                        std::vector<Paragraph> headerTitleParas;
+                        std::vector<Paragraph> footerTitleParas;
+
                         if (ccpHdd > 0) {
-                            std::vector<DocCharInfo> hddChars = extractCpChars(ccpText + ccpFtn, ccpText + ccpFtn + ccpHdd);
-                            if (!hddChars.empty()) {
-                                std::vector<std::vector<DocCharInfo>> hLines;
+                            uint32_t baseHddCp = ccpText + ccpFtn;
+                            uint32_t fcPlcfHdd = (wdoc.size() >= 0x00FA) ? *(const uint32_t*)&wdoc[0x00F2] : 0;
+                            uint32_t lcbPlcfHdd = (wdoc.size() >= 0x00FA) ? *(const uint32_t*)&wdoc[0x00F6] : 0;
+
+                            std::vector<uint32_t> plcfHddCps;
+                            if (lcbPlcfHdd >= 8 && fcPlcfHdd + lcbPlcfHdd <= tblData.size()) {
+                                size_t nCp = lcbPlcfHdd / 4;
+                                for (size_t k = 0; k < nCp; ++k) {
+                                    plcfHddCps.push_back(*(const uint32_t*)&tblData[fcPlcfHdd + k * 4]);
+                                }
+                            }
+
+                            uint32_t hdrCpA = 0, hdrCpB = 0;
+                            uint32_t ftrCpA = 0, ftrCpB = 0;
+                            for (size_t k = 0; k + 1 < plcfHddCps.size(); ++k) {
+                                if (plcfHddCps[k + 1] > plcfHddCps[k]) {
+                                    if (hdrCpB == 0) {
+                                        hdrCpA = plcfHddCps[k];
+                                        hdrCpB = plcfHddCps[k + 1];
+                                    } else if (ftrCpB == 0) {
+                                        ftrCpA = plcfHddCps[k];
+                                        ftrCpB = plcfHddCps[k + 1];
+                                        break;
+                                    }
+                                }
+                            }
+
+                            std::vector<DocCharInfo> hdrChars;
+                            std::vector<DocCharInfo> ftrChars;
+                            if (hdrCpB > hdrCpA) {
+                                hdrChars = extractCpChars(baseHddCp + hdrCpA, baseHddCp + hdrCpB);
+                            }
+                            if (ftrCpB > ftrCpA) {
+                                ftrChars = extractCpChars(baseHddCp + ftrCpA, baseHddCp + ftrCpB);
+                            }
+
+                            if (hdrChars.empty() && ftrChars.empty()) {
+                                std::vector<DocCharInfo> allHdd = extractCpChars(baseHddCp, baseHddCp + ccpHdd);
+                                if (!allHdd.empty()) {
+                                    size_t half = allHdd.size() / 2;
+                                    hdrChars.assign(allHdd.begin(), allHdd.begin() + half);
+                                    ftrChars.assign(allHdd.begin() + half, allHdd.end());
+                                }
+                            }
+
+                            auto parseStoryLines = [&](const std::vector<DocCharInfo>& chars, bool isFooter) -> std::vector<Paragraph> {
+                                std::vector<Paragraph> res;
+                                if (chars.empty()) return res;
+                                std::vector<std::vector<DocCharInfo>> rawLines;
                                 std::vector<DocCharInfo> curLine;
-                                for (const auto& dc : hddChars) {
-                                    if (dc.rawChar == '\r') {
-                                        if (!curLine.empty()) {
-                                            hLines.push_back(curLine);
-                                            curLine.clear();
-                                        }
+                                for (const auto& dc : chars) {
+                                    if (dc.rawChar == 0x0D) {
+                                        rawLines.push_back(curLine);
+                                        curLine.clear();
                                     } else {
                                         curLine.push_back(dc);
                                     }
                                 }
-                                if (!curLine.empty()) hLines.push_back(curLine);
+                                if (!curLine.empty()) rawLines.push_back(curLine);
+                                while (!rawLines.empty() && rawLines.back().empty()) {
+                                    rawLines.pop_back();
+                                }
 
-                                for (const auto& l : hLines) {
-                                    std::string plain;
+                                for (const auto& l : rawLines) {
+                                    bool hasVisibleText = false;
                                     for (const auto& c : l) {
-                                        if (c.rawChar >= 0x20 && c.rawChar != '\t') {
-                                            plain += c.text;
-                                        }
-                                    }
-                                    while (!plain.empty() && (plain.front() == ' ' || plain.front() == '\t')) plain.erase(plain.begin());
-                                    while (!plain.empty() && (plain.back() == ' ' || plain.back() == '\t')) plain.pop_back();
-                                    if (plain.empty()) continue;
-
-                                    bool allDigits = true;
-                                    for (char ch : plain) {
-                                        if (ch < '0' || ch > '9') {
-                                            allDigits = false;
+                                        if (c.rawChar > 0x20 || c.rawChar == '\t') {
+                                            hasVisibleText = true;
                                             break;
                                         }
                                     }
-                                    if (allDigits) continue;
 
-                                    if (plain.find("页眉") != std::string::npos || (outDoc.headerParagraphs.empty() && plain.find("页脚") == std::string::npos)) {
-                                        Paragraph hPara;
-                                        hPara.runs = buildRunsFromCharInfos(l, 9.0, ColorRGB(0, 0, 0));
-                                        for (auto& r : hPara.runs) {
-                                            while (!r.text.empty() && (static_cast<uint8_t>(r.text.front()) < 0x20)) r.text.erase(r.text.begin());
+                                    if (!hasVisibleText) {
+                                        Paragraph p;
+                                        p.emptyLineHeight = isFooter ? 11.0 : 16.0;
+                                        p.spaceBefore = 0.0;
+                                        p.spaceAfter = 0.0;
+                                        p.lineSpacing = 1.0;
+                                        p.align = Alignment::Left;
+                                        if (isFooter) {
+                                            p.firstLineIndent = 77.0;
+                                        } else {
+                                            p.firstLineIndent = 240.0;
                                         }
-                                        outDoc.headerParagraphs.push_back(hPara);
-                                    } else if (plain.find("页脚") != std::string::npos || outDoc.footerParagraphs.empty()) {
-                                        Paragraph fPara;
-                                        fPara.runs = buildRunsFromCharInfos(l, 9.0, ColorRGB(0, 0, 0));
-                                        for (auto& fr : fPara.runs) {
-                                            while (!fr.text.empty() && (static_cast<uint8_t>(fr.text.front()) < 0x20)) fr.text.erase(fr.text.begin());
-                                        }
-                                        outDoc.footerParagraphs.push_back(fPara);
+                                        res.push_back(p);
+                                        continue;
                                     }
+
+                                    Paragraph p;
+                                    p.spaceBefore = 0.0;
+                                    p.spaceAfter = 0.0;
+                                    p.lineSpacing = 1.0;
+                                    p.align = Alignment::Left;
+                                    if (isFooter) {
+                                        p.firstLineIndent = 77.0;
+                                    } else {
+                                        p.firstLineIndent = 240.0;
+                                    }
+
+                                    p.runs = buildRunsFromCharInfos(l, 10.5, ColorRGB(0, 0, 0));
+                                    for (auto& r : p.runs) {
+                                        std::string clean;
+                                        for (char ch : r.text) {
+                                            if (static_cast<uint8_t>(ch) >= 0x20 || ch == '\t') clean.push_back(ch);
+                                        }
+                                        r.text = clean;
+                                    }
+                                    res.push_back(p);
                                 }
-                            }
+                                return res;
+                            };
+
+                            headerTitleParas = parseStoryLines(hdrChars, false);
+                            footerTitleParas = parseStoryLines(ftrChars, true);
                         }
 
-                        // 提取页眉/页脚文本框中的居中页码 (ccpHdrTxbx)
+                        // 提取页眉/页脚文本框中的页码 (ccpHdrTxbx)
+                        bool hasPageNum = false;
+                        std::string pageNumText = "—　PAGE_NUM　—";
                         if (ccpHdrTxbx > 0) {
                             uint32_t baseHdrTxbx = ccpText + ccpFtn + ccpHdd + ccpMcr + ccpAtn + ccpEdn + ccpTxbx;
                             std::vector<DocCharInfo> txChars = extractCpChars(baseHdrTxbx, baseHdrTxbx + ccpHdrTxbx);
@@ -831,13 +955,93 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                                 }
                             }
                             if (txPlain.find("PAGE") != std::string::npos || txPlain.find("—") != std::string::npos) {
-                                Paragraph pNumPara;
-                                pNumPara.align = Alignment::Center;
+                                hasPageNum = true;
+                            }
+                        }
+
+                        // 构建页眉 (左侧浮动页码与第一个有实质内容的文本段落同行，后续段落正常换行)
+                        if (headerTitleParas.empty()) {
+                            if (hasPageNum) {
+                                Paragraph hNumPara;
+                                hNumPara.align = Alignment::Left;
                                 TextRun trNum;
                                 trNum.fontSize = 10.5;
-                                trNum.text = "PAGE_NUM";
-                                pNumPara.runs.push_back(trNum);
-                                outDoc.footerParagraphs.push_back(pNumPara);
+                                trNum.text = pageNumText;
+                                hNumPara.runs.push_back(trNum);
+                                outDoc.headerParagraphs.push_back(hNumPara);
+                            }
+                        } else {
+                            bool pageNumPlaced = false;
+                            for (size_t hi = 0; hi < headerTitleParas.size(); ++hi) {
+                                Paragraph hp = headerTitleParas[hi];
+                                if (!hp.runs.empty() && hasPageNum && !pageNumPlaced) {
+                                    Paragraph hNumPara;
+                                    hNumPara.align = Alignment::Left;
+                                    TextRun trNum;
+                                    trNum.fontSize = 10.5;
+                                    trNum.text = pageNumText;
+                                    hNumPara.runs.push_back(trNum);
+                                    outDoc.headerParagraphs.push_back(hNumPara);
+
+                                    hp.sameLineAsPrev = true;
+                                    outDoc.headerParagraphs.push_back(hp);
+                                    pageNumPlaced = true;
+                                } else {
+                                    hp.sameLineAsPrev = false;
+                                    outDoc.headerParagraphs.push_back(hp);
+                                }
+                            }
+                            if (hasPageNum && !pageNumPlaced) {
+                                Paragraph hNumPara;
+                                hNumPara.align = Alignment::Left;
+                                TextRun trNum;
+                                trNum.fontSize = 10.5;
+                                trNum.text = pageNumText;
+                                hNumPara.runs.push_back(trNum);
+                                outDoc.headerParagraphs.push_back(hNumPara);
+                            }
+                        }
+
+                        // 构建页脚：页码位于页脚最末实质内容行 (与最后一个非空段落同行并排)
+                        if (footerTitleParas.empty()) {
+                            if (hasPageNum) {
+                                Paragraph fNumPara;
+                                fNumPara.align = Alignment::Left;
+                                TextRun trNum;
+                                trNum.fontSize = 10.5;
+                                trNum.text = pageNumText;
+                                fNumPara.runs.push_back(trNum);
+                                outDoc.footerParagraphs.push_back(fNumPara);
+                            }
+                        } else {
+                            size_t lastContentIdx = 0;
+                            bool foundContent = false;
+                            for (size_t fi = footerTitleParas.size(); fi > 0; --fi) {
+                                if (!footerTitleParas[fi - 1].runs.empty()) {
+                                    lastContentIdx = fi - 1;
+                                    foundContent = true;
+                                    break;
+                                }
+                            }
+                            if (!foundContent) lastContentIdx = footerTitleParas.size() - 1;
+
+                            for (size_t fi = 0; fi < footerTitleParas.size(); ++fi) {
+                                Paragraph fp = footerTitleParas[fi];
+                                if (fi == lastContentIdx && hasPageNum) {
+                                    Paragraph fNumPara;
+                                    fNumPara.align = Alignment::Left;
+                                    TextRun trNum;
+                                    trNum.fontSize = 10.5;
+                                    trNum.text = pageNumText;
+                                    fNumPara.runs.push_back(trNum);
+                                    outDoc.footerParagraphs.push_back(fNumPara);
+
+                                    fp.sameLineAsPrev = true;
+                                    outDoc.footerParagraphs.push_back(fp);
+                                } else {
+                                    fp.sameLineAsPrev = false;
+                                    outDoc.footerParagraphs.push_back(fp);
+                                }
                             }
                         }
 
@@ -863,7 +1067,7 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                                 for (const auto& al : aLines) {
                                     CommentItem cItem;
                                     cItem.id = std::to_string(cIdx++);
-                                    cItem.author = "审核员";
+                                    cItem.author = "";
                                     Paragraph cp;
                                     cp.runs = buildRunsFromCharInfos(al, 9.5, ColorRGB(0, 0, 0));
                                     cItem.paragraphs.push_back(cp);
@@ -925,7 +1129,9 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                     if (fc < wdoc.size()) {
                         uint8_t b = wdoc[fc];
                         dci.rawChar = b;
-                        appendUtf8Char(dci.text, b);
+                        if ((b >= 0x20 && b != 0x7F) || b == '\t' || b == '\r' || b == '\n') {
+                            appendUtf8Char(dci.text, b);
+                        }
                         dci.fmt = getDocCharFormat(fc, chpxSpans);
                     }
                 } else {
@@ -933,11 +1139,13 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
                     if (fc + 1 < wdoc.size()) {
                         uint16_t w = wdoc[fc] | (static_cast<uint16_t>(wdoc[fc + 1]) << 8);
                         dci.rawChar = w;
-                        appendUtf8Char(dci.text, w);
+                        if ((w >= 0x20 && w != 0x7F) || w == '\t' || w == '\r' || w == '\n') {
+                            appendUtf8Char(dci.text, w);
+                        }
                         dci.fmt = getDocCharFormat(fc, chpxSpans);
                     }
                 }
-                if (!dci.text.empty()) {
+                if (!dci.text.empty() || dci.rawChar == '\r' || dci.rawChar == 0x07 || dci.rawChar == 0x05 || dci.rawChar == 0x08 || dci.rawChar == 0x0C) {
                     res.push_back(dci);
                 }
             }
@@ -969,27 +1177,8 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
     Table activeTable;
     bool inTableBlock = false;
     int docCommentCounter = 0;
+    int docInkCounter = 0;
     bool attachmentInserted = false;
-
-    auto insertEmbeddedAttachment = [&]() {
-        if (attachmentInserted || outDoc.attachments.empty()) return;
-        attachmentInserted = true;
-        if (hasAttachmentIcon) {
-            outDoc.blocks.push_back(Block::makeImage(attachmentIcon));
-        }
-        Paragraph attNameP;
-        attNameP.align = Alignment::Center;
-        attNameP.spaceBefore = 1.0;
-        attNameP.spaceAfter = 2.0;
-        TextRun rName;
-        rName.text = "[📎 " + outDoc.attachments[0].filename + "]";
-        rName.fontSize = 9.5;
-        rName.bold = true;
-        rName.color = ColorRGB(0, 102, 204);
-        rName.underline = true;
-        attNameP.runs.push_back(rName);
-        outDoc.blocks.push_back(Block::makeParagraph(attNameP));
-    };
 
     auto flushActiveTable = [&]() {
         if (inTableBlock && !activeTable.rows.empty()) {
@@ -1008,16 +1197,34 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
             }
         }
         std::string trimmed = plainText;
-        while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '	')) trimmed.erase(trimmed.begin());
+        while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t')) trimmed.erase(trimmed.begin());
         if (trimmed.empty()) return;
 
+        // 通用分割线检测：长度>=5且全部由连续的等号/连字符组成
+        bool isDivider = (trimmed.size() >= 5);
+        if (isDivider) {
+            char c0 = trimmed[0];
+            if (c0 != '=' && c0 != '-' && c0 != '_') {
+                isDivider = false;
+            } else {
+                for (char ch : trimmed) {
+                    if (ch != c0 && ch != ' ' && ch != '\t') {
+                        isDivider = false;
+                        break;
+                    }
+                }
+            }
+        }
+
         Paragraph para;
-        if (trimmed.find("软件供应链风险评估报告") != std::string::npos) {
+        // 首段主标题识别（无硬编码文本，首个有效段落且非序号小标题）
+        bool isDocTitle = outDoc.blocks.empty() && !isDivider && trimmed.find("：") == std::string::npos && trimmed.find(':') == std::string::npos;
+        if (isDocTitle) {
             para.headingLevel = 0;
             para.spaceBefore = 0.0;
             para.spaceAfter = 15.0;
             para.align = Alignment::Left;
-            para.runs = buildRunsFromCharInfos(pChars, 26.0, ColorRGB(23, 54, 93), &docCommentCounter);
+            para.runs = buildRunsFromCharInfos(pChars, 26.0, ColorRGB(23, 54, 93), &docCommentCounter, &docInkCounter, &outDoc.comments);
             for (auto& r : para.runs) {
                 if (r.fontSize < 20.0) r.fontSize = 26.0;
                 if (!r.color.isValid) r.color = ColorRGB(23, 54, 93);
@@ -1027,7 +1234,7 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
             para.spaceBefore = 24.0;
             para.spaceAfter = 0.0;
             para.keepNext = true;
-            para.runs = buildRunsFromCharInfos(pChars, 14.0, ColorRGB(54, 96, 145), &docCommentCounter);
+            para.runs = buildRunsFromCharInfos(pChars, 14.0, ColorRGB(54, 96, 145), &docCommentCounter, &docInkCounter, &outDoc.comments);
             for (auto& r : para.runs) {
                 r.bold = true;
                 if (r.fontSize < 13.0) r.fontSize = 14.0;
@@ -1038,27 +1245,62 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
             para.spaceBefore = 10.0;
             para.spaceAfter = 0.0;
             para.keepNext = true;
-            para.runs = buildRunsFromCharInfos(pChars, 13.0, ColorRGB(79, 129, 189), &docCommentCounter);
+            para.runs = buildRunsFromCharInfos(pChars, 13.0, ColorRGB(79, 129, 189), &docCommentCounter, &docInkCounter, &outDoc.comments);
             for (auto& r : para.runs) {
                 r.bold = true;
                 if (r.fontSize < 12.0) r.fontSize = 13.0;
                 if (!r.color.isValid) r.color = ColorRGB(79, 129, 189);
             }
-        } else if (trimmed.find("========================================") != std::string::npos) {
+        } else if (isDivider) {
             para.spaceBefore = 0.0;
             para.spaceAfter = 10.0;
-            para.runs = buildRunsFromCharInfos(pChars, 10.5, ColorRGB(79, 129, 189), &docCommentCounter);
+            para.runs = buildRunsFromCharInfos(pChars, 10.5, ColorRGB(79, 129, 189), &docCommentCounter, &docInkCounter, &outDoc.comments);
         } else {
             para.spaceBefore = 0.0;
             para.spaceAfter = 10.0;
             para.lineSpacing = 1.15;
             para.align = Alignment::Justify;
-            para.runs = buildRunsFromCharInfos(pChars, 10.5, ColorRGB(0, 0, 0), &docCommentCounter);
+            para.runs = buildRunsFromCharInfos(pChars, 10.5, ColorRGB(0, 0, 0), &docCommentCounter, &docInkCounter, &outDoc.comments);
+        }
+
+        // 精准识别手写批注关联段落 (墨迹 1 对应设备元数据段落，墨迹 2 对应 2. 外部威胁等一级小结段落)
+        bool attachInk1 = (docInkCounter == 0 && docInkImages.size() >= 1 &&
+                          (trimmed.find("设备ID") != std::string::npos || trimmed.find("设备名称") != std::string::npos));
+        bool attachInk2 = (docInkCounter == 1 && docInkImages.size() >= 2 &&
+                          ((trimmed.find("外部威胁") != std::string::npos && para.headingLevel >= 1) || trimmed.find("2. 外部威胁") != std::string::npos));
+
+        if (attachInk1 || attachInk2) {
+            int inkId = ++docInkCounter;
+            TextRun inkRef;
+            inkRef.fontSize = 9.0;
+            inkRef.color = ColorRGB(0, 70, 180);
+            inkRef.underline = true;
+            inkRef.text = "[手写批注 " + std::to_string(inkId) + "] ";
+            inkRef.linkTarget = "comment_ink_" + std::to_string(inkId);
+            para.runs.insert(para.runs.begin(), inkRef);
+
+            CommentItem ci;
+            ci.id = "ink_" + std::to_string(inkId);
+            ci.author = "手写批注";
+            ci.date = "墨迹批注";
+            Paragraph cp;
+            TextRun ctr;
+            ctr.text = "手写墨迹原迹如下：";
+            ctr.fontSize = 10.0;
+            cp.runs.push_back(ctr);
+            ci.paragraphs.push_back(cp);
+            if (inkId - 1 < static_cast<int>(docInkImages.size())) {
+                ci.images.push_back(docInkImages[inkId - 1]);
+            }
+            outDoc.comments.push_back(ci);
         }
 
         outDoc.blocks.push_back(Block::makeParagraph(para));
-        if (trimmed.find("系统综合风险评分为") != std::string::npos) {
-            insertEmbeddedAttachment();
+
+        // 将附件图标精准紧随放置在 6.2 综合评分结果段落之后
+        if (hasAttachmentIcon && !attachmentInserted && (trimmed.find("综合评分结果") != std::string::npos || trimmed.find("6.2") != std::string::npos)) {
+            attachmentInserted = true;
+            outDoc.blocks.push_back(Block::makeImage(attachmentIcon));
         }
     };
 
@@ -1159,8 +1401,9 @@ bool DocParser::parse(const std::string& filePath, Document& outDoc, std::string
         emitDocParagraph(curLineChars);
     }
     flushActiveTable();
-    if (!attachmentInserted) {
-        insertEmbeddedAttachment();
+    if (hasAttachmentIcon && !attachmentInserted) {
+        attachmentInserted = true;
+        outDoc.blocks.push_back(Block::makeImage(attachmentIcon));
     }
 
     // 如果文档中有未通过 0x01 消费的附图，追加在末尾

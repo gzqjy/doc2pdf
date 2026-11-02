@@ -72,14 +72,27 @@ static bool extractFromOle2Binary(const std::vector<uint8_t>& oleBytes,
                                   std::vector<uint8_t>& outPayload) {
     if (oleBytes.size() >= 8 &&
         oleBytes[0] == 0xD0 && oleBytes[1] == 0xCF && oleBytes[2] == 0x11 && oleBytes[3] == 0xE0) {
-        // 写入临时文件并通过 POLE 打开
-        char tmpPath[] = "/tmp/doc2pdf_ole_XXXXXX";
-        int fd = mkstemp(tmpPath);
+        // 写入临时文件并通过 POLE 打开（动态获取临时目录环境变量，消除硬编码）
+        std::string tmpDir = "/tmp";
+        const char* envTmp = std::getenv("TMPDIR");
+        if (envTmp == nullptr || *envTmp == '\0') envTmp = std::getenv("TEMP");
+        if (envTmp == nullptr || *envTmp == '\0') envTmp = std::getenv("TMP");
+        if (envTmp != nullptr && *envTmp != '\0') {
+            tmpDir = envTmp;
+        }
+        if (!tmpDir.empty() && tmpDir.back() != '/' && tmpDir.back() != '\\') {
+            tmpDir.push_back('/');
+        }
+        std::string tmpTemplate = tmpDir + "doc2pdf_ole_XXXXXX";
+        std::vector<char> tmpPath(tmpTemplate.begin(), tmpTemplate.end());
+        tmpPath.push_back('\0');
+
+        int fd = mkstemp(tmpPath.data());
         if (fd != -1) {
             ssize_t written = write(fd, oleBytes.data(), oleBytes.size());
             close(fd);
             if (written == static_cast<ssize_t>(oleBytes.size())) {
-                POLE::Storage st(tmpPath);
+                POLE::Storage st(tmpPath.data());
                 if (st.open()) {
                     std::list<std::string> entries = st.entries("/");
                     for (const auto& ent : entries) {
@@ -91,7 +104,7 @@ static bool extractFromOle2Binary(const std::vector<uint8_t>& oleBytes,
                                 s.read(sData.data(), sData.size());
                                 if (parseOle10NativeStream(sData.data(), sData.size(), outFilename, outPayload)) {
                                     st.close();
-                                    unlink(tmpPath);
+                                    unlink(tmpPath.data());
                                     return true;
                                 }
                             }
@@ -100,7 +113,7 @@ static bool extractFromOle2Binary(const std::vector<uint8_t>& oleBytes,
                     st.close();
                 }
             }
-            unlink(tmpPath);
+            unlink(tmpPath.data());
         }
     }
     // 尝试直接作为 Ole10Native 流解析
@@ -154,20 +167,44 @@ static std::string stripXmlFallback(const std::string& xml) {
     res.reserve(xml.size());
     size_t cur = 0;
     while (cur < xml.size()) {
-        size_t fbPos = xml.find("<mc:Fallback", cur);
-        if (fbPos == std::string::npos) {
+        size_t acPos = xml.find("<mc:AlternateContent", cur);
+        if (acPos == std::string::npos) {
             res.append(xml, cur, xml.size() - cur);
             break;
         }
-        res.append(xml, cur, fbPos - cur);
-        size_t fbEnd = xml.find("</mc:Fallback>", fbPos);
-        if (fbEnd != std::string::npos) {
-            cur = fbEnd + 14;
-        } else {
+        res.append(xml, cur, acPos - cur);
+        size_t acEnd = xml.find("</mc:AlternateContent>", acPos);
+        if (acEnd == std::string::npos) {
+            res.append(xml, acPos, xml.size() - acPos);
             break;
         }
-    }
+        acEnd += 22;
+        std::string acChunk = xml.substr(acPos, acEnd - acPos);
 
+        // 如果是墨迹批注（Choice 中包含 wordprocessingInk/ink），保留 Fallback 中的墨迹预渲染图片
+        if (acChunk.find("wordprocessingInk") != std::string::npos || acChunk.find("ink/") != std::string::npos) {
+            size_t fbPos = acChunk.find("<mc:Fallback");
+            if (fbPos != std::string::npos) {
+                size_t fbTagClose = acChunk.find('>', fbPos);
+                size_t fbEnd = acChunk.find("</mc:Fallback>", fbTagClose);
+                if (fbTagClose != std::string::npos && fbEnd != std::string::npos) {
+                    std::string fbContent = acChunk.substr(fbTagClose + 1, fbEnd - (fbTagClose + 1));
+                    res.append(fbContent);
+                }
+            }
+        } else {
+            // 普通 AlternateContent：剔除 Fallback，保留 Choice
+            size_t fbPos = acChunk.find("<mc:Fallback");
+            if (fbPos != std::string::npos) {
+                size_t fbEnd = acChunk.find("</mc:Fallback>", fbPos);
+                if (fbEnd != std::string::npos) {
+                    acChunk.erase(fbPos, (fbEnd + 14) - fbPos);
+                }
+            }
+            res.append(acChunk);
+        }
+        cur = acEnd;
+    }
     return res;
 }
 
@@ -800,6 +837,7 @@ void DocxParser::parseDocumentXmlWithMedia(const std::string& xml,
         }
     }
 
+    int docxInkCounter = 0;
 
     size_t pos = 0;
     while (pos < xml.size()) {
@@ -869,13 +907,21 @@ void DocxParser::parseDocumentXmlWithMedia(const std::string& xml,
                 }
             }
 
-            // 提取段落内嵌插图 (DrawingML / VML)
+            // 提取段落内嵌插图 (DrawingML / VML) 与手写墨迹批注 (wordprocessingInk / VML gfxdata ink)
+            bool paraHasInk = false;
+            std::vector<ImageBlock> paraInkImages;
+
             size_t drawPos = 0;
             while ((drawPos = pXml.find("<w:drawing", drawPos)) != std::string::npos) {
                 size_t drawEnd = pXml.find("</w:drawing>", drawPos);
                 if (drawEnd == std::string::npos) break;
                 drawEnd += 12;
                 std::string drawXml = pXml.substr(drawPos, drawEnd - drawPos);
+
+                if (drawXml.find("wordprocessingInk") != std::string::npos || drawXml.find("ink/") != std::string::npos) {
+                    pXml.erase(drawPos, drawEnd - drawPos);
+                    continue;
+                }
 
                 size_t blipPos = drawXml.find("<a:blip");
                 if (blipPos != std::string::npos) {
@@ -920,13 +966,15 @@ void DocxParser::parseDocumentXmlWithMedia(const std::string& xml,
                 drawPos = drawEnd;
             }
 
-            // 支持 VML 插图 <w:pict><v:shape><v:imagedata r:id="..."/></w:pict>
+            // 支持 VML 插图与手写墨迹批注 <w:pict><v:shape><v:imagedata r:id="..."/></w:pict>
             size_t pictPos = 0;
             while ((pictPos = pXml.find("<w:pict", pictPos)) != std::string::npos) {
                 size_t pictEnd = pXml.find("</w:pict>", pictPos);
                 if (pictEnd == std::string::npos) break;
                 pictEnd += 9;
                 std::string pictXml = pXml.substr(pictPos, pictEnd - pictPos);
+
+                bool isInkPict = (pictXml.find("ink") != std::string::npos || pictXml.find("gfxdata") != std::string::npos);
 
                 size_t imgDataPos = pictXml.find("<v:imagedata");
                 if (imgDataPos != std::string::npos) {
@@ -937,10 +985,37 @@ void DocxParser::parseDocumentXmlWithMedia(const std::string& xml,
                         std::string fmt;
                         int pw = 0, ph = 0;
                         if (parseImageDimensions(it->second.data(), it->second.size(), fmt, pw, ph)) {
-                            double dw = std::min(450.0, (double)pw);
-                            double dh = dw * ((double)ph / pw);
-                            ImageBlock imgBlock(it->second, fmt, pw, ph, dw, dh);
-                            outDoc.blocks.push_back(Block::makeImage(imgBlock));
+                            // 过滤微小占位点 (如 4x3 透明图)，仅对有效手写墨迹图设置批注
+                            if (pw > 10 && ph > 10) {
+                                if (isInkPict) {
+                                    paraHasInk = true;
+                                }
+                                double dw = 92.0, dh = 74.0;
+                                size_t shapePos = pictXml.find("<v:shape");
+                                if (shapePos != std::string::npos) {
+                                    std::string styleStr = extractAttr(pictXml.substr(shapePos), "style");
+                                    size_t wIdx = styleStr.find("width:");
+                                    if (wIdx != std::string::npos) {
+                                        double val = std::strtod(styleStr.c_str() + wIdx + 6, nullptr);
+                                        if (val > 0) dw = val;
+                                    }
+                                    size_t hIdx = styleStr.find("height:");
+                                    if (hIdx != std::string::npos) {
+                                        double val = std::strtod(styleStr.c_str() + hIdx + 7, nullptr);
+                                        if (val > 0) dh = val;
+                                    }
+                                }
+                                if (dw <= 0 || dh <= 0) {
+                                    dw = std::min(450.0, (double)pw);
+                                    dh = dw * ((double)ph / pw);
+                                }
+                                ImageBlock imgBlock(it->second, fmt, pw, ph, dw, dh);
+                                if (isInkPict) {
+                                    paraInkImages.push_back(imgBlock);
+                                } else {
+                                    outDoc.blocks.push_back(Block::makeImage(imgBlock));
+                                }
+                            }
                         }
                     }
                 }
@@ -948,6 +1023,7 @@ void DocxParser::parseDocumentXmlWithMedia(const std::string& xml,
             }
 
             // 支持段落内嵌对象/附件 <w:object><v:shape ...><v:imagedata r:id="..."/></v:shape><o:OLEObject r:id="..."/></w:object>
+            std::vector<ImageBlock> paraAttachImages;
             size_t objPos = 0;
             while ((objPos = pXml.find("<w:object", objPos)) != std::string::npos) {
                 size_t objEnd = pXml.find("</w:object>", objPos);
@@ -979,20 +1055,20 @@ void DocxParser::parseDocumentXmlWithMedia(const std::string& xml,
                     }
                 }
 
-                // 从 shape style 解析图标尺寸 (控制在紧凑的图标尺寸 32pt 以内)
-                double dw = 32.0, dh = 32.0;
+                // 从 shape style 解析图标原始尺寸
+                double dw = 90.0, dh = 90.0;
                 size_t shapePos = objXml.find("<v:shape");
                 if (shapePos != std::string::npos) {
                     std::string styleStr = extractAttr(objXml.substr(shapePos), "style");
                     size_t wIdx = styleStr.find("width:");
                     if (wIdx != std::string::npos) {
                         double val = std::strtod(styleStr.c_str() + wIdx + 6, nullptr);
-                        if (val > 0) dw = std::min(32.0, val);
+                        if (val > 0) dw = val;
                     }
                     size_t hIdx = styleStr.find("height:");
                     if (hIdx != std::string::npos) {
                         double val = std::strtod(styleStr.c_str() + hIdx + 7, nullptr);
-                        if (val > 0) dh = std::min(32.0, val);
+                        if (val > 0) dh = val;
                     }
                 }
 
@@ -1001,25 +1077,15 @@ void DocxParser::parseDocumentXmlWithMedia(const std::string& xml,
                     std::string fmt;
                     int pw = 0, ph = 0;
                     if (parseImageDimensions(itImg->second.data(), itImg->second.size(), fmt, pw, ph)) {
+                        if (dw > 65.0 || dh > 65.0) {
+                            dw = 58.0;
+                            dh = 58.0;
+                        }
                         ImageBlock imgBlock(itImg->second, fmt, pw, ph, dw, dh);
-                        outDoc.blocks.push_back(Block::makeImage(imgBlock));
+                        imgBlock.isAttachment = true;
+                        imgBlock.attachmentIndex = outDoc.attachments.empty() ? 0 : (outDoc.attachments.size() - 1);
+                        paraAttachImages.push_back(imgBlock);
                     }
-                }
-
-                // 在图标下方生成带有附件真实文件名的超链接段落，正文中直接呈现
-                if (!attFilename.empty()) {
-                    Paragraph attNameP;
-                    attNameP.align = Alignment::Center;
-                    attNameP.spaceBefore = 1.0;
-                    attNameP.spaceAfter = 2.0;
-                    TextRun rName;
-                    rName.text = "[📎 " + attFilename + "]";
-                    rName.fontSize = 9.5;
-                    rName.bold = true;
-                    rName.color = ColorRGB(0, 102, 204);
-                    rName.underline = true;
-                    attNameP.runs.push_back(rName);
-                    outDoc.blocks.push_back(Block::makeParagraph(attNameP));
                 }
 
                 pXml.erase(objPos, objEnd - objPos);
@@ -1029,8 +1095,36 @@ void DocxParser::parseDocumentXmlWithMedia(const std::string& xml,
             Paragraph para;
             parseParagraphXml(pXml, para, styles);
 
+            if (paraHasInk) {
+                docxInkCounter++;
+                TextRun inkRef;
+                inkRef.fontSize = 9.0;
+                inkRef.color = ColorRGB(0, 70, 180);
+                inkRef.underline = true;
+                inkRef.text = "[手写批注 " + std::to_string(docxInkCounter) + "]";
+                inkRef.linkTarget = "comment_ink_" + std::to_string(docxInkCounter);
+                para.runs.insert(para.runs.begin(), inkRef);
+
+                CommentItem ci;
+                ci.id = "ink_" + std::to_string(docxInkCounter);
+                ci.author = "手写批注";
+                ci.date = "墨迹批注";
+                Paragraph cp;
+                TextRun ctr;
+                ctr.text = "手写墨迹原迹如下：";
+                ctr.fontSize = 10.0;
+                cp.runs.push_back(ctr);
+                ci.paragraphs.push_back(cp);
+                ci.images = paraInkImages;
+                outDoc.comments.push_back(ci);
+            }
+
             if (!para.runs.empty() || para.pageBreakBefore || !hadImage) {
                 outDoc.blocks.push_back(Block::makeParagraph(para));
+            }
+            // 将附件图标紧随段落标题之后发射
+            for (const auto& attImg : paraAttachImages) {
+                outDoc.blocks.push_back(Block::makeImage(attImg));
             }
             pos = pEnd;
         }
@@ -1616,7 +1710,7 @@ void DocxParser::parseParagraphXml(const std::string& pXml, Paragraph& para, con
         if (!activeCommentId.empty()) {
             run.commentId = activeCommentId;
             if (!run.bgColor.isValid) {
-                run.bgColor = ColorRGB(255, 242, 178); // 批注高亮底色
+                run.bgColor = ColorRGB(255, 255, 0); // 批注高亮底色 (纯黄)
             }
             run.color = ColorRGB(180, 50, 0); // 批注文字颜色变化
         }

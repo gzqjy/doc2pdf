@@ -1243,6 +1243,7 @@ struct PdfAnnotRecord {
     size_t attachmentIndex = 0;
     size_t objId = 0;
     size_t filespecObjId = 0;
+    size_t apObjId = 0;
 };
 
 static void renderLineSpans(std::ostringstream& stream,
@@ -1464,8 +1465,10 @@ static void renderHeaderFooter(const std::vector<Paragraph>& paras,
                                FontGlyphRegistry* glyphRegistry,
                                double linePitch = 0.0) {
     if (paras.empty()) return;
+    stream << "q\n";
     double inlineGroupSavedY = curY;
     double maxGroupDrop = 0.0;
+    double groupMaxFontSize = 0.0;
     for (size_t i = 0; i < paras.size(); ++i) {
         const auto& p = paras[i];
         if (p.sameLineAsPrev) {
@@ -1473,13 +1476,22 @@ static void renderHeaderFooter(const std::vector<Paragraph>& paras,
         } else {
             inlineGroupSavedY = curY;
             maxGroupDrop = 0.0;
+            groupMaxFontSize = 0.0;
+            size_t groupEnd = i + 1;
+            while (groupEnd < paras.size() && paras[groupEnd].sameLineAsPrev) {
+                groupEnd++;
+            }
+            for (size_t gi = i; gi < groupEnd; ++gi) {
+                for (const auto& r : paras[gi].runs) {
+                    if (r.fontSize > groupMaxFontSize) groupMaxFontSize = r.fontSize;
+                }
+            }
         }
         double beforeY = curY;
         Paragraph resolvedP = p;
         if (resolvedP.runs.empty()) {
             double baseEmpty = (resolvedP.emptyLineHeight > 0.0) ? resolvedP.emptyLineHeight : 10.5;
-            if (linePitch > 0.0 && baseEmpty < linePitch) baseEmpty = linePitch;
-            else if (resolvedP.lineSpacing > 0.0) baseEmpty *= resolvedP.lineSpacing;
+            if (resolvedP.lineSpacing > 0.0 && resolvedP.lineSpacing != 1.0) baseEmpty *= resolvedP.lineSpacing;
             double emptyH = baseEmpty + resolvedP.spaceAfter;
             curY -= emptyH;
             double thisDrop = beforeY - curY;
@@ -1534,7 +1546,8 @@ static void renderHeaderFooter(const std::vector<Paragraph>& paras,
             if (!zones[0].runs.empty()) {
                 auto lns = breakIntoLines(zones[0], contentWidth, metrics);
                 for (const auto& line : lns) {
-                    double baseline = curY - line.maxFontSize * 0.82;
+                    double effectiveFontSz = (groupMaxFontSize > 0.0) ? groupMaxFontSize : line.maxFontSize;
+                double baseline = curY - effectiveFontSz * 0.82;
                     double startX = marginX + resolvedP.leftIndent + resolvedP.firstLineIndent;
                     renderLineSpans(stream, line, startX, baseline, 0.0, metrics, glyphRegistry);
                     double lh = calcDynamicLineHeight(line, resolvedP.lineSpacing, linePitch);
@@ -1545,7 +1558,8 @@ static void renderHeaderFooter(const std::vector<Paragraph>& paras,
             if (!zones[1].runs.empty()) {
                 auto lns = breakIntoLines(zones[1], contentWidth, metrics);
                 for (const auto& line : lns) {
-                    double baseline = curY - line.maxFontSize * 0.82;
+                    double effectiveFontSz = (groupMaxFontSize > 0.0) ? groupMaxFontSize : line.maxFontSize;
+                double baseline = curY - effectiveFontSz * 0.82;
                     double startX = marginX + (contentWidth - line.totalWidthPt) / 2.0;
                     renderLineSpans(stream, line, startX, baseline, 0.0, metrics, glyphRegistry);
                     double lh = calcDynamicLineHeight(line, resolvedP.lineSpacing, linePitch);
@@ -1556,7 +1570,8 @@ static void renderHeaderFooter(const std::vector<Paragraph>& paras,
             if (!zones[2].runs.empty()) {
                 auto lns = breakIntoLines(zones[2], contentWidth, metrics);
                 for (const auto& line : lns) {
-                    double baseline = curY - line.maxFontSize * 0.82;
+                    double effectiveFontSz = (groupMaxFontSize > 0.0) ? groupMaxFontSize : line.maxFontSize;
+                double baseline = curY - effectiveFontSz * 0.82;
                     double startX = marginX + (contentWidth - line.totalWidthPt);
                     renderLineSpans(stream, line, startX, baseline, 0.0, metrics, glyphRegistry);
                     double lh = calcDynamicLineHeight(line, resolvedP.lineSpacing, linePitch);
@@ -1576,8 +1591,11 @@ static void renderHeaderFooter(const std::vector<Paragraph>& paras,
                     startX = marginX + (contentWidth - line.totalWidthPt) / 2.0;
                 } else if (resolvedP.align == Alignment::Right) {
                     startX = marginX + (contentWidth - line.totalWidthPt);
+                } else if (resolvedP.sameLineAsPrev && resolvedP.leftIndent == 0.0 && resolvedP.firstLineIndent == 0.0) {
+                    startX = marginX + (contentWidth - line.totalWidthPt);
                 }
-                double baseline = curY - line.maxFontSize * 0.82;
+                double effectiveFontSz = (groupMaxFontSize > 0.0) ? groupMaxFontSize : line.maxFontSize;
+                double baseline = curY - effectiveFontSz * 0.82;
                 renderLineSpans(stream, line, startX, baseline, 0.0, metrics, glyphRegistry);
                 double lh = calcDynamicLineHeight(line, resolvedP.lineSpacing, linePitch);
                 curY -= lh;
@@ -1589,6 +1607,7 @@ static void renderHeaderFooter(const std::vector<Paragraph>& paras,
         if (thisDrop > maxGroupDrop) maxGroupDrop = thisDrop;
         curY = inlineGroupSavedY - maxGroupDrop;
     }
+    stream << "Q\n";
 }
 
 static void renderParagraph(const Paragraph& para,
@@ -1602,7 +1621,7 @@ static void renderParagraph(const Paragraph& para,
                             FontGlyphRegistry* glyphRegistry = nullptr,
                             double linePitch = 0.0,
                             std::vector<PdfAnnotRecord>* annotCollector = nullptr,
-                            size_t curPageIndex = 0,
+                            const size_t& curPageIndex = 0,
                             std::map<std::string, std::tuple<size_t, double, double>>* namedTargets = nullptr) {
     if (para.pageBreakBefore) {
         startNewPage();
@@ -1974,14 +1993,17 @@ static void writePdfStructure(std::ofstream& out,
         }
     }
 
+    // 严格按照 PDF 对象输出顺序确定性分配 ID：先写入透明外观流 emptyApObjId，再写入页面注记
+    size_t emptyApObjId = 0;
+    if (!attachments.empty()) {
+        emptyApObjId = nextObjId++;
+    }
+
     // 为页面注记分配 ID
     for (size_t p = 0; p < numPages; ++p) {
         if (p >= pageAnnots.size()) continue;
         for (auto& ar : pageAnnots[p]) {
             ar.objId = nextObjId++;
-            if (ar.type == "FileAttachment" && ar.attachmentIndex < attObjs.size()) {
-                ar.filespecObjId = attObjs[ar.attachmentIndex].filespecId;
-            }
         }
     }
 
@@ -2183,75 +2205,62 @@ static void writePdfStructure(std::ofstream& out,
         std::string fsContent = "<< /Type /Filespec\n"
                                 "   /F (" + safeFn + ")\n"
                                 "   /UF (" + safeFn + ")\n"
-                                "   /EF << /F " + std::to_string(aInfo.efId) + " 0 R >>\n"
+                                "   /EF << /F " + std::to_string(aInfo.efId) + " 0 R /UF " + std::to_string(aInfo.efId) + " 0 R >>\n"
                                 "   /Desc (" + safeDesc + ")\n"
                                 ">>";
         writeObj(fsContent);
     }
 
-    // 写入页面注记（/Subtype /Link 与 /Subtype /FileAttachment）
+    if (emptyApObjId > 0) {
+        writeObj("<< /Type /XObject /Subtype /Form /BBox [ 0 0 1 1 ] /Length 0 >>\nstream\n\nendstream");
+    }
+
+    // 写入页面注记（支持原生 FileAttachment 与平滑链接跳转，配合透明外观流杜绝黄色便签弹窗）
     for (size_t p = 0; p < numPages; ++p) {
         if (p >= pageAnnots.size()) continue;
         for (const auto& ar : pageAnnots[p]) {
-            if (ar.type == "Link") {
+            if (ar.type == "Link" || ar.type == "FileAttachment") {
                 size_t targetPageObjId = 3 + ar.targetPageIndex * 2;
-                std::string linkContent =
-                    "<< /Type /Annot\n"
-                    "   /Subtype /Link\n"
-                    "   /Rect [ " + std::to_string(ar.x1) + " " + std::to_string(ar.y1) + " "
-                                  + std::to_string(ar.x2) + " " + std::to_string(ar.y2) + " ]\n"
-                    "   /Border [ 0 0 0 ]\n"
-                    "   /A << /S /GoTo /D [ " + std::to_string(targetPageObjId) + " 0 R /XYZ "
-                                              + std::to_string(ar.targetX) + " "
-                                              + std::to_string(ar.targetY) + " null ] >>\n"
-                    ">>";
-                writeObj(linkContent);
-            } else if (ar.type == "FileAttachment") {
-                std::string safeFn = escapePdfString(ar.filename);
-                std::string faContent =
-                    "<< /Type /Annot\n"
-                    "   /Subtype /FileAttachment\n"
-                    "   /Rect [ " + std::to_string(ar.x1) + " " + std::to_string(ar.y1) + " "
-                                  + std::to_string(ar.x2) + " " + std::to_string(ar.y2) + " ]\n"
-                    "   /FS " + std::to_string(ar.filespecObjId) + " 0 R\n"
-                    "   /Name /Paperclip\n"
-                    "   /C [ 0.1 0.4 0.8 ]\n"
-                    "   /T (" + safeFn + ")\n"
-                    "   /Contents (双击打开或保存附件)\n"
-                    ">>";
-                writeObj(faContent);
-            }
-        }
-    }
+                if (!ar.filename.empty()) {
+                    std::string safeFn = escapePdfString(ar.filename);
+                    size_t fsId = (ar.attachmentIndex < attObjs.size()) ? attObjs[ar.attachmentIndex].filespecId : 0;
+                    std::string fsEntry = (fsId > 0) ? ("   /FS " + std::to_string(fsId) + " 0 R\n") : "";
+                    std::string apEntry = (emptyApObjId > 0) ? ("   /AP << /N " + std::to_string(emptyApObjId) + " 0 R >>\n") : "";
+                    std::string actionEntry =
+                        "   /A << /S /JavaScript\n"
+                        "         /JS (try { this.exportDataObject({cName: \"" + safeFn + "\", nLaunch: 2}); } catch(e) { try { this.exportDataObject({cName: \"" + safeFn + "\"}); } catch(e2) {} })\n";
+                    if (!ar.linkTarget.empty() && ar.targetPageIndex < numPages) {
+                        actionEntry += "         /Next << /S /GoTo /D [ " + std::to_string(targetPageObjId) + " 0 R /XYZ "
+                                      + std::to_string(ar.targetX) + " "
+                                      + std::to_string(ar.targetY) + " null ] >>\n";
+                    }
+                    actionEntry += "      >>\n";
 
-    for (size_t m = 0; m < docImages.size(); ++m) {
-        const auto& img = docImages[m];
-        xref.push_back((size_t)out.tellp());
-        size_t id = xref.size() - 1;
-
-        if (img.format == "jpeg") {
-            out << id << " 0 obj\n"
-                << "<< /Type /XObject /Subtype /Image\n"
-                << "   /Width " << img.pixelWidth << " /Height " << img.pixelHeight << "\n"
-                << "   /ColorSpace /DeviceRGB /BitsPerComponent 8\n"
-                << "   /Filter /DCTDecode\n"
-                << "   /Length " << img.data.size() << " >>\n"
-                << "stream\n";
-            out.write((const char*)img.data.data(), img.data.size());
-            out << "\nendstream\nendobj\n";
-        } else {
-            int pw = img.pixelWidth, ph = img.pixelHeight;
-            std::vector<uint8_t> compressedRgb;
-            if (decodePngToRgbStream(img.data.data(), img.data.size(), pw, ph, compressedRgb)) {
-                out << id << " 0 obj\n"
-                    << "<< /Type /XObject /Subtype /Image\n"
-                    << "   /Width " << pw << " /Height " << ph << "\n"
-                    << "   /ColorSpace /DeviceRGB /BitsPerComponent 8\n"
-                    << "   /Filter /FlateDecode\n"
-                    << "   /Length " << compressedRgb.size() << " >>\n"
-                    << "stream\n";
-                out.write((const char*)compressedRgb.data(), compressedRgb.size());
-                out << "\nendstream\nendobj\n";
+                    std::string annotContent =
+                        "<< /Type /Annot\n"
+                        "   /Subtype /FileAttachment\n"
+                        "   /Rect [ " + std::to_string(ar.x1) + " " + std::to_string(ar.y1) + " "
+                                      + std::to_string(ar.x2) + " " + std::to_string(ar.y2) + " ]\n"
+                        "   /Border [ 0 0 0 ]\n"
+                        "   /F 4\n"
+                        + fsEntry
+                        + apEntry
+                        + actionEntry +
+                        ">>";
+                    writeObj(annotContent);
+                } else {
+                    std::string linkContent =
+                        "<< /Type /Annot\n"
+                        "   /Subtype /Link\n"
+                        "   /Rect [ " + std::to_string(ar.x1) + " " + std::to_string(ar.y1) + " "
+                                      + std::to_string(ar.x2) + " " + std::to_string(ar.y2) + " ]\n"
+                        "   /Border [ 0 0 0 ]\n"
+                        "   /A << /S /GoTo /D [ " + std::to_string(targetPageObjId) + " 0 R /XYZ "
+                                                              + std::to_string(ar.targetX) + " "
+                                                              + std::to_string(ar.targetY) + " null ] >>\n"
+                        ">>";
+                    writeObj(linkContent);
+                }
             }
         }
     }
@@ -2353,6 +2362,13 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
     for (const auto& b : doc.blocks) {
         if (b.type == BlockType::Image && !b.image.data.empty()) {
             allImages.push_back(b.image);
+        }
+    }
+    for (const auto& c : doc.comments) {
+        for (const auto& img : c.images) {
+            if (!img.data.empty()) {
+                allImages.push_back(img);
+            }
         }
     }
 
@@ -2463,6 +2479,23 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
                           << "/Im" << (currentImageIdx + 1) << " Do\n"
                           << "Q\n";
 
+            if (img.isAttachment && img.attachmentIndex < doc.attachments.size()) {
+                std::string attId = std::to_string(img.attachmentIndex + 1);
+                namedTargets["ref_attachment_" + attId] = std::make_tuple(curPageIndex, imgX, imgY + img.displayHeightPt);
+
+                PdfAnnotRecord ar;
+                ar.pageIndex = curPageIndex;
+                ar.x1 = imgX;
+                ar.y1 = imgY;
+                ar.x2 = imgX + img.displayWidthPt;
+                ar.y2 = imgY + img.displayHeightPt;
+                ar.type = "Link";
+                ar.linkTarget = "";
+                ar.filename = doc.attachments[img.attachmentIndex].filename;
+                ar.attachmentIndex = img.attachmentIndex;
+                allAnnots.push_back(ar);
+            }
+
             currentY -= img.displayHeightPt;
             prevSpaceAfter = 10.0;
             isPageStart = false;
@@ -2514,7 +2547,7 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
         }
     }
 
-    // 渲染批注与备注清单 (Comments & Notes)
+    // 渲染批注清单 (Comments)
     if (!doc.comments.empty()) {
         Paragraph cmTitleP;
         cmTitleP.headingLevel = 2;
@@ -2526,16 +2559,14 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
         trCmTitle.bold = true;
         cmTitleP.runs.push_back(trCmTitle);
 
-        if (currentY - 40.0 < marginBottom) {
+        // 防孤行：预留标题与首条批注的组合空间，不足则整体换页
+        if (currentY - 70.0 < marginBottom) {
             startNewPage();
         }
         currentY -= cmTitleP.spaceBefore;
         renderParagraph(cmTitleP, currentStream, currentY, startNewPage, contentWidth, marginX, marginBottom, metrics, &glyphRegistry, doc.pageSetup.linePitch, &allAnnots, curPageIndex, &namedTargets);
 
         for (const auto& c : doc.comments) {
-            // 设立批注在文末清单中的锚点
-            namedTargets["comment_" + c.id] = std::make_tuple(curPageIndex, marginX, currentY);
-
             Paragraph cP;
             cP.spaceBefore = 4.0;
             cP.spaceAfter = 6.0;
@@ -2543,7 +2574,12 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
             rPrefix.fontSize = 10.0;
             rPrefix.bold = true;
             rPrefix.color = ColorRGB(100, 100, 100);
-            rPrefix.text = "[批注 " + c.id + "] ";
+            if (c.id.find("ink_") != std::string::npos) {
+                std::string num = c.id.substr(4);
+                rPrefix.text = "[手写批注 " + num + "] ";
+            } else {
+                rPrefix.text = "[批注 " + c.id + "] ";
+            }
             if (!c.author.empty()) rPrefix.text += c.author + " ";
             if (!c.date.empty()) rPrefix.text += "(" + c.date + "): ";
             cP.runs.push_back(rPrefix);
@@ -2564,10 +2600,40 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
             rBack.linkTarget = "ref_" + c.id;
             cP.runs.push_back(rBack);
 
-            if (currentY - 20.0 < marginBottom) {
+            if (currentY - 38.0 < marginBottom) {
                 startNewPage();
             }
+            // 设立批注在文末清单中的锚点（在换页完成后记录，确保精准跳到条目渲染所在的真实页面）
+            namedTargets["comment_" + c.id] = std::make_tuple(curPageIndex, marginX, currentY);
+
             renderParagraph(cP, currentStream, currentY, startNewPage, contentWidth, marginX, marginBottom, metrics, &glyphRegistry, doc.pageSetup.linePitch, &allAnnots, curPageIndex, &namedTargets);
+
+            // 渲染手写墨迹原图 (紧随本批注项下方，统一展示在批注清单中)
+            for (const auto& inkImg : c.images) {
+                if (inkImg.data.empty()) continue;
+                double dw = (inkImg.displayWidthPt > 0) ? inkImg.displayWidthPt : 120.0;
+                double dh = (inkImg.displayHeightPt > 0) ? inkImg.displayHeightPt : 90.0;
+                if (dw > contentWidth * 0.55) {
+                    double s = (contentWidth * 0.55) / dw;
+                    dw = contentWidth * 0.55;
+                    dh *= s;
+                }
+                if (currentY - dh - 8.0 < marginBottom) {
+                    startNewPage();
+                }
+                currentY -= 4.0;
+                double imgX = marginX + 16.0;
+                double imgY = currentY - dh;
+                currentStream << "q "
+                              << dw << " 0 0 " << dh << " "
+                              << imgX << " " << imgY << " cm\n"
+                              << "/Im" << (currentImageIdx + 1) << " Do\n"
+                              << "Q\n";
+                currentY -= (dh + 6.0);
+                prevSpaceAfter = 6.0;
+                isPageStart = false;
+                ++currentImageIdx;
+            }
         }
     }
 
@@ -2578,12 +2644,13 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
         attTitleP.spaceBefore = 10.0;
         attTitleP.spaceAfter = 4.0;
         TextRun trAttTitle;
-        trAttTitle.text = "📎 内嵌附件清单 (Attachments)";
+        trAttTitle.text = "内嵌附件清单 (Attachments)";
         trAttTitle.fontSize = 12.0;
         trAttTitle.bold = true;
         attTitleP.runs.push_back(trAttTitle);
 
-        if (currentY - 40.0 < marginBottom) {
+        // 防孤行：预留标题与首条附件的组合空间，不足则整体换页
+        if (currentY - 70.0 < marginBottom) {
             startNewPage();
         }
         currentY -= attTitleP.spaceBefore;
@@ -2592,11 +2659,12 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
         for (size_t aIdx = 0; aIdx < doc.attachments.size(); ++aIdx) {
             const auto& att = doc.attachments[aIdx];
             Paragraph attP;
+            attP.leftIndent = 0.0;
             attP.spaceBefore = 4.0;
             attP.spaceAfter = 6.0;
 
             TextRun rIcon;
-            rIcon.text = "[📎 附件 " + std::to_string(aIdx + 1) + "] " + att.filename;
+            rIcon.text = "[附件 " + std::to_string(aIdx + 1) + "] " + att.filename;
             rIcon.fontSize = 10.5;
             rIcon.bold = true;
             rIcon.color = ColorRGB(0, 102, 204);
@@ -2622,23 +2690,59 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
                 attP.runs.push_back(rInfo);
             }
 
-            if (currentY - 24.0 < marginBottom) {
+            std::string attId = std::to_string(aIdx + 1);
+
+            // 在清单条目末尾添加 [跳回正文] 链接
+            TextRun rBack;
+            rBack.text = " [跳回正文]";
+            rBack.fontSize = 9.0;
+            rBack.color = ColorRGB(0, 102, 204);
+            rBack.linkTarget = "ref_attachment_" + attId;
+            attP.runs.push_back(rBack);
+
+            if (currentY - 38.0 < marginBottom) {
                 startNewPage();
             }
 
-            // 注册针对此附件的 FileAttachment 页面注释（点击或阅读器面板皆可查看下载）
+            // 设立附件在文末清单中的锚点（在换页完成后记录）
+            namedTargets["attachment_" + attId] = std::make_tuple(curPageIndex, marginX, currentY);
+
+            // 计算前面“附件名称与大小”文本的物理宽度，严密隔离右侧的 [跳回正文] 链接
+            double attNameWidth = 0.0;
+            for (const auto& r : attP.runs) {
+                if (r.linkTarget.empty()) {
+                    auto atoms = tokenizeRun(r, metrics);
+                    for (const auto& a : atoms) attNameWidth += a.widthPt;
+                }
+            }
+            if (attNameWidth <= 0.0) attNameWidth = 180.0;
+
+            double beforeY = currentY;
+            size_t annotBefore = allAnnots.size();
+            renderParagraph(attP, currentStream, currentY, startNewPage, contentWidth, marginX, marginBottom, metrics, &glyphRegistry, doc.pageSetup.linePitch, &allAnnots, curPageIndex, &namedTargets);
+            size_t annotAfter = allAnnots.size();
+
+            // 查找刚才排版中生成的 [跳回正文] Link 注解的实际物理起始 X 坐标
+            double jumpLinkX = marginX + attNameWidth + 10.0;
+            for (size_t ai = annotBefore; ai < annotAfter; ++ai) {
+                if (allAnnots[ai].linkTarget == "ref_attachment_" + attId) {
+                    jumpLinkX = allAnnots[ai].x1;
+                    break;
+                }
+            }
+
+            // 注册针对此附件的点击导出动作 (仅覆盖条目左侧名称与大小文字，留足 6pt 物理安全间隙，绝不覆盖右侧跳回正文)
             PdfAnnotRecord ar;
             ar.pageIndex = curPageIndex;
             ar.x1 = marginX;
-            ar.y1 = currentY - 16.0;
-            ar.x2 = marginX + 260.0;
-            ar.y2 = currentY + 4.0;
-            ar.type = "FileAttachment";
+            ar.y1 = currentY - 2.0;
+            ar.x2 = std::min(marginX + attNameWidth, jumpLinkX - 6.0);
+            ar.y2 = beforeY + 2.0;
+            ar.type = "Link";
             ar.filename = att.filename;
             ar.attachmentIndex = aIdx;
+            ar.linkTarget = "";
             allAnnots.push_back(ar);
-
-            renderParagraph(attP, currentStream, currentY, startNewPage, contentWidth, marginX, marginBottom, metrics, &glyphRegistry, doc.pageSetup.linePitch, &allAnnots, curPageIndex, &namedTargets);
         }
     }
 
@@ -2655,8 +2759,51 @@ bool PdfRenderer::render(const Document& doc, const std::string& outputPath, std
         // Word 页眉位置：由页面顶端向下偏移 headerMargin
         double headerY = pageHeight - doc.pageSetup.headerMargin;
 
-        // Word 页脚位置：footerMargin 是页面底端到页脚底部的距离，从顶部向下排版
-        double footerTopY = doc.pageSetup.footerMargin + (totalFooterHeight > 0.0 ? totalFooterHeight : 12.0);
+        // Word 原生页脚排版：页脚最底部基线对齐到 (footerMargin + descent)，前面各行向上堆叠
+        // 确保无论页脚有多少行，最底下一行永远紧贴在 footerMargin 处，高度与 Word/LibreOffice 完全一致
+        double totalFooterDrop = 0.0;
+        double currentGroupDrop = 0.0;
+        for (size_t i = 0; i < doc.footerParagraphs.size(); ++i) {
+            const auto& fp = doc.footerParagraphs[i];
+            // 最后一组同行段落不计入后续行的下降
+            bool isLastGroup = (i + 1 == doc.footerParagraphs.size());
+            if (!isLastGroup && i + 2 == doc.footerParagraphs.size() && doc.footerParagraphs.back().sameLineAsPrev) {
+                isLastGroup = true;
+            }
+            if (isLastGroup) break;
+
+            double pH = 0.0;
+            if (fp.runs.empty()) {
+                double baseEmpty = (fp.emptyLineHeight > 0.0) ? fp.emptyLineHeight : 10.5;
+                if (fp.lineSpacing > 0.0 && fp.lineSpacing != 1.0) baseEmpty *= fp.lineSpacing;
+                pH = baseEmpty + fp.spaceAfter;
+            } else {
+                double maxSz = 0.0;
+                for (const auto& r : fp.runs) {
+                    if (r.fontSize > maxSz) maxSz = r.fontSize;
+                }
+                if (maxSz <= 0.0) maxSz = 10.5;
+                double ls = (fp.lineSpacing > 0.0) ? fp.lineSpacing : 1.0;
+                pH = (maxSz * 1.15 * ls) + fp.spaceAfter;
+            }
+
+            if (fp.sameLineAsPrev) {
+                if (pH > currentGroupDrop) {
+                    totalFooterDrop += (pH - currentGroupDrop);
+                    currentGroupDrop = pH;
+                }
+            } else {
+                totalFooterDrop += pH;
+                currentGroupDrop = pH;
+            }
+        }
+        double lastLineSz = 10.5;
+        if (!doc.footerParagraphs.empty()) {
+            for (const auto& r : doc.footerParagraphs.back().runs) {
+                if (r.fontSize > lastLineSz) lastLineSz = r.fontSize;
+            }
+        }
+        double footerTopY = doc.pageSetup.footerMargin + 3.0 + totalFooterDrop + lastLineSz * 0.82;
 
         for (size_t p = 0; p < totalP; ++p) {
             std::ostringstream hfStream;
